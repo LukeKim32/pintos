@@ -5,6 +5,7 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "syscall.h"
 
 #define INVALID_VADDR -1
 
@@ -152,12 +153,17 @@ page_fault (struct intr_frame *f)
   user = (f->error_code & PF_U) != 0;
 
   /** page fault의 원인이 커널 메모리 영역 참조일 경우, 프로세스 종료 */
+
   if (is_kernel_vaddr(fault_addr)){
    exit(INVALID_VADDR);
   } 
-  if(!user) {
+  if(!user || not_present) {
     exit(INVALID_VADDR);
   }
+
+  // if ((PHYS_BASE <= user && fault_addr) || !not_present) {
+  //   exit(INVALID_VADDR);
+  // }
 
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to

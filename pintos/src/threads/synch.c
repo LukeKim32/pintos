@@ -113,11 +113,39 @@ sema_up (struct semaphore *sema)
   ASSERT (sema != NULL);
 
   old_level = intr_disable ();
-  if (!list_empty (&sema->waiters)) 
-    thread_unblock (list_entry (list_pop_front (&sema->waiters),
-                                struct thread, elem));
+
+  struct list_elem * eachSleepingNode;
+  struct thread * targetSleepingThread;
+  struct thread * maxPrioritySleepingThread;
+
+  // sema를 기다리고 있는 애들 중, Priority가 가장 큰 애를 골라서 꺠운다
+  if (!list_empty (&sema->waiters)) {
+
+    eachSleepingNode = list_begin(&sema->waiters);
+    //max 초기값 설정
+    maxPrioritySleepingThread = list_entry(eachSleepingNode, struct thread, elem);
+
+    eachSleepingNode = list_next(eachSleepingNode);
+
+    // 2번째 sleeping thread부터 돌면서 Max priority 찾음
+    while(eachSleepingNode!=list_end(&sema->waiters)){
+      targetSleepingThread = list_entry(eachSleepingNode, struct thread, elem);
+      
+      if(targetSleepingThread->priority > maxPrioritySleepingThread->priority){
+        maxPrioritySleepingThread = targetSleepingThread;
+      }
+
+      eachSleepingNode = list_next(eachSleepingNode);
+    }
+
+    list_remove(&maxPrioritySleepingThread->elem);
+    
+    thread_unblock(maxPrioritySleepingThread);
+  }
   sema->value++;
   intr_set_level (old_level);
+
+  thread_yield();
 }
 
 static void sema_test_helper (void *sema_);

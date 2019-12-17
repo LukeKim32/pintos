@@ -2,6 +2,8 @@
 #include <debug.h>
 #include "filesys/inode.h"
 #include "threads/malloc.h"
+#include "lib/user/syscall.h"
+#include "threads/synch.h"
 
 /* An open file. */
 struct file 

@@ -24,22 +24,25 @@ test_mlfqs_load_1 (void)
   ASSERT (thread_mlfqs);
 
   msg ("spinning for up to 45 seconds, please wait...");
-
+  
   start_time = timer_ticks ();
   for (;;) 
     {
       load_avg = thread_get_load_avg ();
       ASSERT (load_avg >= 0);
+
+      // printf("디버깅 : load avg : %d, timer_elapsed(start_time) : %d\n",load_avg,timer_elapsed (start_time));
       elapsed = timer_elapsed (start_time) / TIMER_FREQ;
-      if (load_avg > 100)
+      if (load_avg > 50)
+        break;
+      else if (load_avg > 100)
         fail ("load average is %d.%02d "
               "but should be between 0 and 1 (after %d seconds)",
               load_avg / 100, load_avg % 100, elapsed);
-      else if (load_avg > 50)
-        break;
       else if (elapsed > 45)
         fail ("load average stayed below 0.5 for more than 45 seconds");
     }
+
 
   if (elapsed < 38)
     fail ("load average took only %d seconds to rise above 0.5", elapsed);

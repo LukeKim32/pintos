@@ -17,12 +17,24 @@
 #error TIMER_FREQ <= 1000 recommended
 #endif
 
+
+#define ONE_SECOND 100
+
 /* Number of timer ticks since OS booted. */
 static int64_t ticks;
 
 /* Number of loops per timer tick.
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
+
+
+/** Global Sleeping 쓰레드 큐 (list_push_back 으로만 push 해야한다)
+ * timer_sleep() 시 push
+ * 매번 timer_interrupt() 불릴 때마다, 
+ * 큐 내에 sleep중인 쓰레드들의 AlarmTime을 확인해서 깨운다(remove)
+*/
+struct list sleepingThreadsList; 
+
 
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
@@ -37,6 +49,7 @@ timer_init (void)
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  list_init(&sleepingThreadsList);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -86,14 +99,28 @@ timer_elapsed (int64_t then)
 
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
+/** @ticks 시간 이후에 일어날 것을 예약, 그때까지 block */
 void
 timer_sleep (int64_t ticks) 
 {
   int64_t start = timer_ticks ();
+  struct thread * threadToBeSlept = thread_current();
 
   ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+
+  enum intr_level previousInterruptLevel = intr_disable();
+
+  // 알람 시간 설정 후
+  threadToBeSlept->alarmTime = start + ticks;
+
+  // Global sleeping thread list에 등록 (Queue)
+  list_push_back(&sleepingThreadsList,&(threadToBeSlept->elem));
+
+  // Block
+  thread_block();
+
+  intr_set_level(previousInterruptLevel);
+  
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -165,13 +192,42 @@ timer_print_stats (void)
 {
   printf ("Timer: %"PRId64" ticks\n", timer_ticks ());
 }
-
+
+
 /* Timer interrupt handler. */
+/** 매번 호출된다!, Sleeping 쓰레드들의 알람 시간을 매번 확인해서 꺠워준다*/
 static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
+
+  checkAndWakeUpSleepingThreads(ticks);
+
   thread_tick ();
+}
+
+
+/** Sleeping Thread들을 확인하며, 
+   * 알람 시간이 현재 tick보다 작거나 같은 경우, 
+   * UNBLOCK 상태로 바꿔준다 */
+void checkAndWakeUpSleepingThreads(int64_t ticks){
+  struct list_elem * nextSleepingNode = list_begin(&sleepingThreadsList);
+  struct list_elem * currentSleepingNode;
+  struct thread * targetSleepThread;
+
+  while(nextSleepingNode!=list_end(&sleepingThreadsList)){
+
+    currentSleepingNode = nextSleepingNode;
+    nextSleepingNode = list_next(nextSleepingNode);
+
+    targetSleepThread = list_entry(currentSleepingNode,struct thread, elem);
+
+    if(targetSleepThread->alarmTime <= ticks){
+        list_remove(currentSleepingNode);
+        targetSleepThread->alarmTime = ALARM_OFF;
+        thread_unblock(targetSleepThread);
+    }
+  }
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer

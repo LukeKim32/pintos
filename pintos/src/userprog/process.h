@@ -8,11 +8,15 @@ int process_wait (tid_t);
 void process_exit (void);
 void process_activate (void);
 
-
-void parseInput(char *file_name, char *arguments[]);
 void BuildStackWith(char *arguments[], void **esp);
 
+/** @Deprecated */
+void parseInput(char *file_name, char *arguments[]);
+/** @Deprecated */
 void findChildAndListenFinish(struct thread *eachThread, void *aux);
+/** @Deprecated */
 bool checkThreadFinishedByStatus(int status);
+/** @Deprecated */
+int getExitStatusOfChildBy(tid_t child_tid, struct thread * thread);
 
 #endif /* userprog/process.h */

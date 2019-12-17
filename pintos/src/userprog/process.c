@@ -58,13 +58,60 @@ process_execute (const char *file_name)
    return NOT_PROPER_TERMINATION;
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+
+  // printf("프로세스 엑세큐트 : 실행시킨 파일 이름 : %s\n",file_name);
+  
+  tid = thread_create (parsedName, PRI_DEFAULT, start_process, fn_copy);
+
+  // 자식보다 부모 쓰레드가 먼저 끝나는 것을 방지하기 위해
+  // 자식의 Load 완료 까지 기다림
+  sema_down(&(thread_current()->lockForChildLoad));
+
+
+  /**자식 쓰레드의 정상 생성/실패 확인해야함. 
+  *실패 시 => 1) 자식쓰레드는 exit을 호출하며 '자신'의 동적할당 해제(thread_exit()) 
+  *         2) 부모의 리스트에서 자신도 지워야 한다. (부모의 process_wait())
+  */
+
+  struct list_elem * eachChildStatusLink = list_begin(&thread_current()->childStatusList);
+  int childProcessListLength = list_size(&thread_current()->childStatusList);
+
+  int i=0;
+  struct thread * targetChildThread = NULL;
+  struct childStatus * eachChildStatusNode;
+
+  for(;i < childProcessListLength;i++){
+    
+    eachChildStatusNode = list_entry(eachChildStatusLink,struct childStatus, self);
+
+    /** 현재 쓰레드의 자식 쓰레드들에서 일치하는 tid를 찾은 경우
+    * 자식이 오류로 이미 process_exit()에서 다시 잠들었어도, 부모의 리스트에 쓰레드 생성 시 (thread_create()) 추가했기 때문에 무조건 있다.
+    */
+    if(eachChildStatusNode->childTid == tid){
+      targetChildThread = eachChildStatusNode->threadItself;
+      break;
+    }
+
+    eachChildStatusLink = list_next(eachChildStatusLink);
+  }
+
+  /** 찾은 자식이 start_process()에서 Load fail => 종료되어야 해서 이미 process_exit()에서 기다리고 있는 경우 (zombie)
+   * 부모는 wait를 호출 => 1)자식의 exit Status 값 받음, 2) 자식을 종료 & 리스트에서 제거 & 해제
+   * loadFailure 초기값 : true.
+   * start_process()에서 Load 성공해야 false로 변경
+   */ 
+  // if(targetChildThread->loadFailure){
+  if(targetChildThread->loadFailure){
+    return process_wait(tid); //자식을 종료 & 리스트에서 제거 & 해제
+  }
+
+
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy); 
-
   
   return tid;
 }
+
 
 /* A thread function that loads a user process and starts it
    running. */
@@ -75,11 +122,30 @@ start_process (void *file_name_)
   struct intr_frame if_;
   bool success;
   char *arguments[MAX_ARGUMENT_NUMBER]; 
-
+  char *argument;
+  char *ptr;
+  int i;
+  
   // file_name에는 run 뒤의 명령어가 전부 저장됨 ex)echo x
   // 따라서 file_name을 공백 기준으로 parse 하여 arguments 배열에 저장
   // ex) arguments = ["echo", "x"]
-  parseInput(file_name, arguments); 
+
+  // parseInput(file_name, arguments); 
+
+  /** parseInput()내 동적할당 메모리 해제 타이밍 모호 => 로컬 변수로 설정*/
+  char fileNameBuffer[strlen(file_name)+1];
+  strlcpy(fileNameBuffer,file_name,strlen(file_name)+1);
+
+  arguments[COMMAND] = strtok_r(fileNameBuffer, " ", &ptr);// command; ex) echo
+
+  // get rest of arguments
+  for(i = 1; ; i++){
+    argument = strtok_r(NULL, " ", &ptr);
+    if (argument == NULL) {
+      break;
+    }
+    arguments[i] = argument;
+  }
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -91,12 +157,21 @@ start_process (void *file_name_)
 
   if(success){
       BuildStackWith(arguments, &if_.esp);
+      thread_current()->loadFailure = false;
   }
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
+
+  /** 자식보다 부모 쓰레드가 먼저 끝나는 것을 방지하기 위해.
+  * 자신을 기다리고 있는 부모 쓰레드를 재개해준다.
+  */
+  struct thread * parentThread = thread_current()->parent;
+  sema_up(&(parentThread->lockForChildLoad));
+
+  if (!success) {
+    thread_exit (); //이 안에서 우리가 생각 못했던 종료한 경우 -> 말끔히 지워야 한다. 리스트 할당한거 파일디스크립터 할당한거.
+  }
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -107,6 +182,8 @@ start_process (void *file_name_)
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
   NOT_REACHED ();
 }
+
+
 
 /* Waits for thread TID to die and returns its exit status.  If
    it was terminated by the kernel (i.e. killed due to an
@@ -120,104 +197,56 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid) 
 {
-  struct thread *eachThread;
-  struct thread * parentThread;
-  struct list_elem *eachChild;
-  int eachChildIndex;
+
+  struct list_elem *eachChildStatusLink;
+  struct childStatus * eachChildStatusNode;
+  struct childStatus * targetChildStatusNode;
+  struct thread * targetChildThread = NULL;
+  
   int exitStatus = -1;
-  
-  // TID의 Validity 확인
-  // if(isThreadDead(child_tid)){
-  //   return NOT_PROPER_TERMINATION;
-  // }
 
-  // // 이미 wait()이 불려진 쓰레드인지 확인
-  // if(eachThread->waitCalled == true && eachThread->tid != MAIN_THREAD){
-  //   return NOT_PROPER_TERMINATION;
-  // }
-
-  // 반복문 변수 초기화
-  eachChild = list_begin(&thread_current()->childProcessList);
-  int childProcessListLength = list_size(&thread_current()->childProcessList);
- 
-  for(eachChildIndex=0;eachChildIndex < childProcessListLength;eachChildIndex++){
+  eachChildStatusLink = list_begin(&thread_current()->childStatusList);
+  int childStatusListLength = list_size(&thread_current()->childStatusList);
+  int i;
+  for(i=0;i < childStatusListLength;i++){
     
-    eachThread = list_entry(eachChild,struct thread, self);
-    // 현재 쓰레드의 자식 쓰레드들에서 일치하는 tid를 찾은 경우
-    if(eachThread->tid == child_tid){
+    eachChildStatusNode = list_entry(eachChildStatusLink,struct childStatus, self);
 
-      //eachThread->waitCalled == true;
-
-      parentThread = list_entry(eachThread->parent,struct thread,self);
-      /** Block & 쓰레드가 죽는지 계속 listen*/
-      while(1){
-        if(isThreadDead(eachThread)){
-          // 리스닝 하고 있던 쓰레드가 죽었을 경우, 
-          // process_exit()에서 이미 부모 쓰레드의 child Process List에서 삭제되어 왔음
-          break;
-        }
-      }
-
-      /** 죽은 Child 쓰레드의 종료 상태 값(syscall.c/exit()/notifyTermination)을
-       * 찾아 return
-      */
-      struct list_elem * eachChildStatus = list_begin(&parentThread->childStatusList);
-      int childStatusListLength = list_size(&parentThread->childStatusList);
-      struct childStatus * eachChildStatusNode;
-
-      int eachChildIndex;
-  
-      for(eachChildIndex=0;eachChildIndex < childStatusListLength;eachChildIndex++){
-    
-        eachChildStatusNode = list_entry(eachChildStatus,struct childStatus, self);
-
-        if(eachChildStatusNode->childTid == child_tid){
-          exitStatus = eachChildStatusNode->exitStatus;
-          list_remove(eachChildStatus);
-          free(eachChildStatus);
-          break;
-        }
-
-        eachChildStatus = list_next(eachChildStatus);
-      }
-      //
-
-      return exitStatus;
-
+    // 무조건 자식 쓰레드의 메타데이터인 childStatusNode를 찾을 것이다. (자식의 정상 수행/종료 여부와 상관없이)
+    if(eachChildStatusNode->childTid == child_tid){
+      targetChildThread = eachChildStatusNode->threadItself;
+      targetChildStatusNode = eachChildStatusNode; // for Readability
+      break;
     }
 
-    eachChild = list_next(eachChild);
+     eachChildStatusLink = list_next(eachChildStatusLink);
+  }
+
+  // Exception Handling : 없는 자식쓰레드에 대해 wait()을 호출한 경우
+  if(targetChildThread == NULL){
+    return NOT_PROPER_TERMINATION;
   }
 
 
-  return NOT_PROPER_TERMINATION;
-}
+  /** 현 시점 상황: 자신(부모쓰레드)이 wait할 자식 쓰레드를 가리키는 포인터를 찾았다*/
 
-void findChildAndListenFinish(struct thread *eachThread, void *aux){
-  tid_t childTid = ((tid_t *)aux)[1];
-  if(eachThread->tid == childTid){
-    printf("쓰레드 %s finish 리스닝\n",eachThread->name);
-    while(1){
-         if(isThreadDead(eachThread)){
-          printf("쓰레드 끝남!\n");
-          ((tid_t *)aux)[0] = PROPER_TERMINATION;
-          break;
-        }
-      }
-  }
-}
+  // 자식의 실행을 기다리기 위해 sleep
+  // 자식이 이미 기능 수행 완료(실제로는 process_exit()에서 sleep 중) => lockForChildExecute + 1 이 되어있으므로 통과
+  sema_down(&(thread_current()->lockForChildExecute));
 
-bool checkThreadFinishedByStatus(int status){
-  // printf("THread status check : %d\n",status);
-  switch(status){
-    case THREAD_DYING:
-      return true;
-    
-    default:
-      return false;
-  }
-}
+  /** 현 시점 상황: 자식은 다 수행하고, syscall/exit()을 호출 => 현재쓰레드(부모)를 깨우고, 자신은 sleep*/
 
+  exitStatus = targetChildStatusNode->exitStatus;
+
+  // 자식 Status 노드(메타데이터)를 자신(부모)의 ChildStatus Linked List에서 제외&해제한다.
+  list_remove(&(targetChildStatusNode->self));
+  free(targetChildStatusNode);
+
+  // 자식쓰레드가 exit()이 마저 실행되어 사라지도록 sleep에서 깨워준다
+  sema_up(&(targetChildThread->alarmByParent));
+
+  return exitStatus;
+}
 
 
 /* Free the current process's resources. */
@@ -228,10 +257,15 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
-  /** 쓰레드 메모리 해제 전,
-  * 자신의 부모 쓰레드의 child Process list에서 자신을 삭제
-  */
-  list_remove(&(cur->self));
+  // 자신(자식쓰레드)의 수행이 완료되었으므로, 부모쓰레드의 sleep을 깨운다.
+  struct thread * parentThread = thread_current()->parent;
+  sema_up(&(parentThread->lockForChildExecute));
+
+
+  // 자신(자식쓰레드)는 완전히 종료되기 전 부모쓰레드가 허용할 때 까지 잠시 sleep.
+  sema_down(&(cur->alarmByParent));
+
+  /** 현 시점 상황 : 부모가 자신(자식쓰레드)의 파괴를 허용함. 자신의 동적할당 메모리를 해제할 것임(thread_exit()에서 진행)*/
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -338,6 +372,8 @@ void BuildStackWith(char *arguments[], void **esp) {
   // Data : 0
   *esp -= 4;
   **(uint32_t **)esp = 0;
+
+  free(addressOfArgumentsInStack);
 
 }
 
@@ -688,4 +724,59 @@ install_page (void *upage, void *kpage, bool writable)
      address, then map our page there. */
   return (pagedir_get_page (th->pagedir, upage) == NULL
           && pagedir_set_page (th->pagedir, upage, kpage, writable));
+}
+
+
+/** User-defined function area */
+
+int getExitStatusOfChildBy(tid_t child_tid, struct thread * thread){
+  
+  int exitStatus=-1;
+
+  struct list_elem * statusListElem = list_begin(&thread->childStatusList);
+  int childStatusListLength = list_size(&thread->childStatusList);
+  struct childStatus * eachChildStatusNode;
+
+  int eachChildIndex;  
+  for(eachChildIndex=0;eachChildIndex < childStatusListLength;eachChildIndex++){
+    
+    eachChildStatusNode = list_entry(statusListElem,struct childStatus, self);
+
+    if(eachChildStatusNode->childTid == child_tid){
+      // printf("겟엑싯스태터스 - child_tid : %d\n",child_tid);
+      exitStatus = eachChildStatusNode->exitStatus;
+      list_remove(statusListElem);
+      
+      free(eachChildStatusNode);
+      break;
+    }
+
+    statusListElem = list_next(statusListElem);
+  }
+  return exitStatus;
+}
+
+void findChildAndListenFinish(struct thread *eachThread, void *aux){
+  tid_t childTid = ((tid_t *)aux)[1];
+  if(eachThread->tid == childTid){
+    printf("쓰레드 %s finish 리스닝\n",eachThread->name);
+    while(1){
+         if(isThreadDead(eachThread)){
+          printf("쓰레드 끝남!\n");
+          ((tid_t *)aux)[0] = PROPER_TERMINATION;
+          break;
+        }
+      }
+  }
+}
+
+bool checkThreadFinishedByStatus(int status){
+  // printf("THread status check : %d\n",status);
+  switch(status){
+    case THREAD_DYING:
+      return true;
+    
+    default:
+      return false;
+  }
 }

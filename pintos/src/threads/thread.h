@@ -5,6 +5,11 @@
 #include <list.h>
 #include <stdint.h>
 #include "synch.h"
+#include "threads/synch.h"
+
+#ifndef USERPROG
+extern bool thread_prior_aging;
+#endif
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -24,6 +29,9 @@ typedef int tid_t;
 #define PRI_MIN 0                       /* Lowest priority. */
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
+
+/* Alarm time */
+#define ALARM_OFF 0
 
 /* A kernel thread or user process.
 
@@ -81,6 +89,9 @@ typedef int tid_t;
    only because they are mutually exclusive: only a thread in the
    ready state is on the run queue, whereas only a thread in the
    blocked state is on a semaphore wait list. */
+
+typedef int64_t fixedFloat;
+
 struct thread
   {
     /* Owned by thread.c. */
@@ -93,16 +104,32 @@ struct thread
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
+   
+    struct lock fileAccessLock;
 
- //#ifdef USERPROG
+    int alarmTime;
+    int recentCPU;
+    int niceValue;
+
+//#ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
-    struct list childProcessList;
-    struct list_elem self; //parent의 ChildProcess Linked List 용
+
     struct list childStatusList; // 자식 List를 2개로 운용(childProcessList가 가리키는 자식 thread가 free되어도 값을 참조하기위해)
-    struct list_elem * parent; // 자신의 parent를 가리키는 용도, 초기화 : init_thread() 
-    bool waitCalled; //이 process에 대해 process_wait()이 불렸는지, 초기화 : init_thread / 값 할당 : process_wait()
- //#endif
+    struct thread * parent; // 자신의 parent를 가리키는 용도, 초기화 : init_thread() 
+
+    struct list fileDescriptorList;
+
+    struct semaphore lockForChildLoad;
+    struct semaphore lockForChildExecute;
+    struct semaphore alarmByParent;
+    struct lock tempLock;
+
+    bool loadFailure;
+
+    
+    
+//#endif
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
@@ -115,8 +142,17 @@ struct childStatus {
    struct list_elem self;
    tid_t childTid;
    int exitStatus;
+   struct thread * threadItself;
 };
 
+/** fileDescriptorList에 Linked List의 노드 구조체 
+ * fileName을 이용한 탐색, number을 이용한 file Descriptor 값을 할당한다.
+*/
+struct fileDescriptor{
+   struct list_elem self;
+   int number;
+   struct file * file;
+};
 
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
@@ -154,7 +190,53 @@ void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
 
-
 bool isThreadDead(struct thread *threadForCheck);
+void cleanMemoryOfCurrentThread(struct thread * curThread);
+
+/** 스케줄러용 User defined Functions */
+
+/** Thread Aging*/
+void thread_aging(void);
+/** @first, @second 쓰레드의 Priority 비교 */
+bool comparePriorityOf(const struct list_elem* first, const struct list_elem* second, void* aux);
+
+
+/** 새로운 Priority 계산*/
+int calculateNewPriorityWith(int recentCPU, int niceValue);
+/** Ready List에서 Maximum priority 값을 얻음*/
+int getMaxPriorityFromReadyQueue(void);
+/** Ready List의 쓰레드들의 Priority 업데이트*/
+void updatePriorityOfEachThread(void);
+/** Ready List의 쓰레드들의 LoadAvg, recentCPU 업데이트*/
+void updateLoadAvg(void);
+void updateRecentCPU(void);
+/** recent_cpu = (2 * load_avg) / (2 * load_avg + 1 ) * recent_cpu + nice */
+// int calculateNewRecentCPUWith(int recentCPU, int nice);
+int calculateNewRecentCPUWith(int loadAverage, int recentCPU, int nice);
+
+
+/** Fixed Point Float 계산 Functions */
+
+int convertTofixedFloat(int integer);
+int convertToInteger(int fixedFloat);
+
+/** 실수 + 정수*/
+int sumOfFloatAndInt(int fixedFloat, int integer);
+/** 정수 - 실수*/
+int subractFloatFromInt(int fixedFloat, int integer);
+/** 실수 / 정수*/
+int divideFloatByInt(int fixedFloat, int integer);
+/** 실수 * 정수*/
+int multiplyFloatAndInt(int fixedFloat, int integer);
+
+/** 실수 * 실수*/
+int multiplyTwoFloats(int fixedFloatOne, int fixedFloatTwo);
+/** 실수 + 실수*/
+int sumOfTwoFloats(int fixedFloatOne, int fixedFloatTwo);
+/** 실수 - 실수*/
+int subtractTwoFloats(int fixedFloatOne, int fixedFloatTwo);
+/** 실수 / 실수*/
+int divideTwoFloats(int fixedFloatOne, int fixedFloatTwo);
+
 
 #endif /* threads/thread.h */

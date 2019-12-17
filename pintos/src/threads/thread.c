@@ -12,9 +12,14 @@
 #include "threads/synch.h"
 #include "threads/vaddr.h"
 #include "threads/malloc.h"
+#include "../filesys/file.h"
+#include "../devices/timer.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
+
+
+#define ONE_SECOND 100
 
 /* Random value for struct thread's `magic' member.
    Used to detect stack overflow.  See the big comment at the top
@@ -54,6 +59,14 @@ static long long user_ticks;    /* # of timer ticks in user programs. */
 /* Scheduling. */
 #define TIME_SLICE 4            /* # of timer ticks to give each thread. */
 static unsigned thread_ticks;   /* # of timer ticks since last yield. */
+
+#ifndef USERPROG
+bool thread_prior_aging;
+#endif
+
+static int loadAvg;
+
+#define READY_LIST_EMPTY -1
 
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
@@ -99,6 +112,9 @@ thread_init (void)
   init_thread (initial_thread, "main", PRI_DEFAULT);
   initial_thread->status = THREAD_RUNNING;
   initial_thread->tid = allocate_tid ();
+  initial_thread->recentCPU = 0;
+  initial_thread->niceValue = 0;
+  loadAvg = 0;
 
 
 }
@@ -122,6 +138,7 @@ thread_start (void)
 
 /* Called by the timer interrupt handler at each timer tick.
    Thus, this function runs in an external interrupt context. */
+/** timer.c / timer_interrupt() 에서 매번 불림 */
 void
 thread_tick (void) 
 {
@@ -137,10 +154,52 @@ thread_tick (void)
   else
     kernel_ticks++;
 
+  if(thread_prior_aging || thread_mlfqs){
+    enum intr_level previousInterruptLevel = intr_disable();
+
+    thread_aging();
+
+    intr_set_level(previousInterruptLevel);
+  }
+
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
+
+
 }
+
+
+void thread_aging(void){
+  struct thread * currentThread = thread_current();
+
+  if(currentThread != idle_thread)
+    currentThread->recentCPU = sumOfFloatAndInt(currentThread->recentCPU,1);//1 더해주기
+  
+
+  // 4 tick 마다, 모든 쓰레드의 priority는 재계산된다.
+  if(timer_ticks()% TIME_SLICE ==0){
+    //update prioirity
+    updatePriorityOfEachThread();
+
+    // Priority update 후에 다시 스케줄링 검사
+    int maxPriority = getMaxPriorityFromReadyQueue();
+    if(currentThread->priority < maxPriority){
+      intr_yield_on_return();
+    }
+  }
+
+  // 1초(100 tick)마다, 모든 쓰레드의 recent CPU value & loadAvg update
+  if(timer_ticks() % ONE_SECOND ==0){
+    // update load avg and recent cpu
+    updateLoadAvg();
+    updateRecentCPU();
+  }
+  
+}
+
+
+
 
 /* Prints thread statistics. */
 void
@@ -192,6 +251,7 @@ thread_create (const char *name, int priority,
   struct childStatus * newChildStatus = (struct childStatus *)malloc(sizeof(struct childStatus));
   newChildStatus->childTid = t->tid;
   newChildStatus->exitStatus = -1;
+  newChildStatus->threadItself = t; // status 노드는 자신의 thread도 가리킨다
   list_push_back(&running_thread()->childStatusList,&(newChildStatus->self));
 #endif
 
@@ -219,6 +279,14 @@ thread_create (const char *name, int priority,
 
   /* Add to run queue. */
   thread_unblock (t);
+
+  int priorityOfRunningThread = thread_get_priority();
+  int priorityOfNewCreatedThread = priority;
+
+  /** 새로 생성한 쓰레드의 Priority가 더 큰 경우, 리스케줄링을한다.*/
+  if(priorityOfRunningThread < priorityOfNewCreatedThread){
+    thread_yield();
+  }
 
   return tid;
 }
@@ -256,8 +324,11 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+
+  list_insert_ordered (&ready_list, &t->elem, comparePriorityOf, NULL);
+  
   t->status = THREAD_READY;
+
   intr_set_level (old_level);
 }
 
@@ -299,13 +370,19 @@ thread_tid (void)
 void
 thread_exit (void) 
 {
-
+  // thread_current()->terminated = true;
   // printf("쓰레드 %s 종료!\n",thread_current()->name);
   ASSERT (!intr_context ());
 
 #ifdef USERPROG
   process_exit ();
+  
 #endif
+
+  
+  // 현재 종료될 쓰레드의 동적할당 메모리를 모두 해제한다.
+  struct thread * curThread = thread_current();
+  cleanMemoryOfCurrentThread(curThread);
 
   /* Remove thread from all threads list, set our status to dying,
      and schedule another process.  That process will destroy us
@@ -317,21 +394,92 @@ thread_exit (void)
   NOT_REACHED ();
 }
 
+/** @curThread 로 넘겨받은 쓰레드 객체의 동적 할당 메모리를 모두 해제한다. 
+*/
+void cleanMemoryOfCurrentThread(struct thread * curThread){
+  struct thread * currentThread = curThread;
+
+  int i;
+
+  //Loop setting
+  struct list_elem * tmpLink = list_begin(&currentThread->childStatusList);
+  struct childStatus * tmpChildStatusNode;
+  struct list_elem * nextTmpLink = tmpLink;
+
+  // Delete Child Status List
+  int childStatusListLength = list_size(&currentThread->childStatusList);
+  for(i=0;i < childStatusListLength;i++){
+    tmpLink = nextTmpLink;
+    tmpChildStatusNode = list_entry(tmpLink,struct childStatus, self);
+    
+    nextTmpLink = list_next(nextTmpLink);
+
+    list_remove(tmpLink);
+    free(tmpChildStatusNode);
+  }
+
+  //Loop setting
+  tmpLink = list_begin(&currentThread->fileDescriptorList);
+  nextTmpLink = tmpLink;
+  struct fileDescriptor * fileDescriptorNode;
+
+  // Delete FileDescriptor List
+  int fileDescriptorListLength = list_size(&currentThread->fileDescriptorList);
+  for(i=0;i < fileDescriptorListLength;i++){
+
+    tmpLink = nextTmpLink;
+    fileDescriptorNode = list_entry(tmpLink,struct fileDescriptor, self);
+#ifdef USERPROG
+    file_close(fileDescriptorNode->file);
+#endif
+
+    nextTmpLink = list_next(nextTmpLink);
+
+    list_remove(tmpLink);
+    free(fileDescriptorNode);
+  }
+
+}
+
+
+/**Returns TRUE if first 쓰레드의 priority > second 쓰레드의 Priority*/
+bool comparePriorityOf(const struct list_elem* first, const struct list_elem* second, void* aux) {
+ 
+  struct thread *firstThread = list_entry(first, struct thread, elem);
+  struct thread *secondThread = list_entry(second, struct thread, elem);
+
+  /** Useless code for delete warning */
+  char *noWarning = aux;
+  noWarning = noWarning;
+  
+  bool result = false;
+  if(firstThread->priority > secondThread->priority){
+    result = true;
+  }
+  
+  return result;
+}
+
 /* Yields the CPU.  The current thread is not put to sleep and
    may be scheduled again immediately at the scheduler's whim. */
 void
 thread_yield (void) 
 {
-  struct thread *cur = thread_current ();
+  struct thread *currentThread = thread_current ();
   enum intr_level old_level;
   
   ASSERT (!intr_context ());
 
   old_level = intr_disable ();
-  if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
-  cur->status = THREAD_READY;
+
+  if (currentThread != idle_thread) 
+    // Priority 값으로 sort해서 넣는다 => Ready Queue의 Priority가 내림차순이다
+    list_insert_ordered (&ready_list, &currentThread->elem, comparePriorityOf, NULL);
+  
+  currentThread->status = THREAD_READY;
+
   schedule ();
+
   intr_set_level (old_level);
 }
 
@@ -357,7 +505,22 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
-  thread_current ()->priority = new_priority;
+  if(thread_mlfqs){
+    return;
+  }
+
+  // 현재 돌고 있는 쓰레드(기존 최고 Priority) Update
+  thread_current()->priority = new_priority;
+
+  //새로 update한 priority는 더이상 최고 Priority가 아닐 수도 있다
+  //레디큐의 최대값과 비교해본다
+  int maxPriorityAmongReadyQueue = getMaxPriorityFromReadyQueue();
+
+  // 더이상 최고 Priority가 아닌 경우, 리스케줄링을 한다
+  if(maxPriorityAmongReadyQueue > new_priority){
+    thread_yield();
+  }
+  
 }
 
 /* Returns the current thread's priority. */
@@ -367,37 +530,7 @@ thread_get_priority (void)
   return thread_current ()->priority;
 }
 
-/* Sets the current thread's nice value to NICE. */
-void
-thread_set_nice (int nice UNUSED) 
-{
-  /* Not yet implemented. */
-}
 
-/* Returns the current thread's nice value. */
-int
-thread_get_nice (void) 
-{
-  /* Not yet implemented. */
-  return 0;
-}
-
-/* Returns 100 times the system load average. */
-int
-thread_get_load_avg (void) 
-{
-  /* Not yet implemented. */
-  return 0;
-}
-
-/* Returns 100 times the current thread's recent_cpu value. */
-int
-thread_get_recent_cpu (void) 
-{
-  /* Not yet implemented. */
-  return 0;
-}
-
 /* Idle thread.  Executes when no other thread is ready to run.
 
    The idle thread is initially put on the ready list by
@@ -490,17 +623,26 @@ init_thread (struct thread *t, const char *name, int priority)
   t->priority = priority;
   t->magic = THREAD_MAGIC;
   list_push_back (&all_list, &t->allelem);
-  t->parent = NULL;
 
-#ifdef USERPROG
-  list_init(&(t->childProcessList));
-  list_push_back(&running_thread()->childProcessList,&(t->self));
-  // printf("%s 쓰레드의 자식 리스트에 %s 추가\n",running_thread()->name,t->name);
+  t->alarmTime = ALARM_OFF;
+  t->recentCPU = running_thread()->recentCPU;
+  t->niceValue = running_thread()->niceValue;
+
+//#ifdef USERPROG
 
   list_init(&(t->childStatusList));
-  t->parent = &(running_thread()->self); //자기 자신의 Parent Thread를 기억한다.
-  // t->waitCalled = false;
-#endif
+  list_init(&(t->fileDescriptorList));
+
+  //자신의 Parent Thread를 가리킨다.
+  t->parent = running_thread(); 
+  
+  sema_init(&(t->lockForChildLoad),0);
+  sema_init(&(t->lockForChildExecute),0);
+  sema_init(&(t->alarmByParent),0);
+  lock_init(&(t->tempLock));
+
+  t->loadFailure = true;
+//#endif
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
@@ -616,3 +758,233 @@ allocate_tid (void)
 /* Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof (struct thread, stack);
+
+/** Functions for fixed point float */
+
+//Fraction : 소수부
+#define FRACTION_OF_FIXED_POINT 16384 //(1<<14)
+
+/** Fixed Floating Point : 일반 실수 * 2^14 */
+
+/** 실수 + 정수 */
+int sumOfFloatAndInt(int fixedFloat, int integer){
+  //정수는 소수부가 없으므로 소수부만큼 shift left를 해준다
+  int floatConvertedFromInteger = integer * FRACTION_OF_FIXED_POINT;
+
+  return fixedFloat + floatConvertedFromInteger;
+}
+
+/** 정수를 Fixed Point Float으로 변환 */
+int convertTofixedFloat(int integer){
+  return integer * FRACTION_OF_FIXED_POINT;
+}
+
+/** Fixed Point Float를 정수로 변환 */
+int convertToInteger(int fixedFloat){
+  return fixedFloat / FRACTION_OF_FIXED_POINT;
+}
+
+/** 정수 - 실수 */
+int subractFloatFromInt(int fixedFloat, int integer){
+  //정수는 소수부가 없으므로 소수부만큼 shift left를 해준다
+  int floatConvertedFromInteger = integer * FRACTION_OF_FIXED_POINT;
+
+  return floatConvertedFromInteger - fixedFloat;
+}
+
+/** 실수 * 실수*/
+int multiplyTwoFloats(int fixedFloatOne, int fixedFloatTwo){
+  int64_t result = fixedFloatOne;
+  result = result * fixedFloatTwo / FRACTION_OF_FIXED_POINT;
+  return (int)result;
+}
+
+/** 실수 + 실수*/
+int sumOfTwoFloats(int fixedFloatOne, int fixedFloatTwo){
+  return fixedFloatOne + fixedFloatTwo;
+}
+
+/** 실수 - 실수*/
+int subtractTwoFloats(int fixedFloatOne, int fixedFloatTwo){
+  return fixedFloatOne - fixedFloatTwo;
+}
+
+/** 실수 / 정수*/
+int divideFloatByInt(int fixedFloat, int integer){
+  return fixedFloat / integer;
+}
+
+/** 실수 * 정수*/
+int multiplyFloatAndInt(int fixedFloat, int integer) {
+  return fixedFloat * integer;
+}
+
+/** 실수 / 실수*/
+int divideTwoFloats(int fixedFloatOne, int fixedFloatTwo){
+  int64_t result = fixedFloatOne;
+  result = fixedFloatOne * FRACTION_OF_FIXED_POINT / fixedFloatTwo;
+  
+  return (int)result;
+}
+
+
+/* Returns the current thread's nice value. */
+int thread_get_nice (void){
+  return thread_current()->niceValue;
+}
+
+
+/* Sets the current thread's nice value to NICE. */
+void thread_set_nice (int new_nice){
+  struct thread * currentThread = thread_current();
+
+  currentThread->niceValue = new_nice;
+
+  currentThread->priority = calculateNewPriorityWith(currentThread->recentCPU, new_nice);
+
+  // updatePriorityOfEachThread();
+  // updateRecentCPU();
+
+  int maxPrioirtyAmongReadyQueue = getMaxPriorityFromReadyQueue();
+
+  /** Current 쓰레드의 priority가 최고값이 아닌 경우, 리스케줄링*/
+  if(currentThread->priority < maxPrioirtyAmongReadyQueue){
+    thread_yield();
+  }
+
+}
+
+
+/** 새로운 Priority 계산*/
+int calculateNewPriorityWith(int recentCPU, int niceValue){
+  
+  /** newPriority = PRI_MAX - (convertToInteger(recentCPU) / 4) - (niceValue * 2) */
+  int floatPRI_MAX = convertTofixedFloat(PRI_MAX);
+  int floatNiceValue = convertTofixedFloat(niceValue);
+  int temp1 = subtractTwoFloats(floatPRI_MAX,divideFloatByInt(recentCPU,4));
+  int floatMediumResults = subtractTwoFloats(temp1, multiplyFloatAndInt(floatNiceValue,2));
+
+  int newPriority = convertToInteger(floatMediumResults); //Priority는 정수!
+
+  if(newPriority > PRI_MAX){
+    newPriority = PRI_MAX;
+  } else if(newPriority < PRI_MIN){
+    newPriority = PRI_MIN;
+  }
+
+  return newPriority;
+}
+
+
+/** Ready List에서 Maximum priority 값을 얻음*/
+int getMaxPriorityFromReadyQueue(void){
+  
+  int readyListLength = list_size(&ready_list);
+
+  if(readyListLength>0){
+    struct list_elem * eachReadyNode = list_begin(&ready_list);
+    struct thread * maxPriorityThread = list_entry(eachReadyNode,struct thread, elem);
+
+    return maxPriorityThread->priority;
+
+  }else{
+    return READY_LIST_EMPTY;
+  }
+}
+
+
+/* Returns 100 times the current thread's recent_cpu value. */
+int thread_get_recent_cpu (void){
+  // 실수를 정수형으로 이용할 것이기 때문에, FRACTION으로 나눔으로써 정수형 형변환 한 것임
+  struct thread * currentThread = thread_current();
+  return convertToInteger(multiplyFloatAndInt(currentThread->recentCPU,100));
+}
+
+
+/* Returns 100 times the system load average. */
+int thread_get_load_avg (void){
+  //mlfqs-load-1의 testcase에서 정수형으로 이용할 것이기 때문에, FRACTION으로 나눔으로써 정수형 형변환 한 것임
+  return convertToInteger(multiplyFloatAndInt(loadAvg,100));
+}
+
+
+/** Ready List의 쓰레드들의 Priority 업데이트
+ * 4 ticks 마다 불림 (timer_interrupt())
+*/
+void updatePriorityOfEachThread(void){
+
+  struct list_elem * eachThreadNode = list_begin(&all_list);
+  struct thread * targetReadyThread;
+
+  while(eachThreadNode!=list_end(&all_list)){
+
+    targetReadyThread = list_entry(eachThreadNode,struct thread, allelem);
+
+    targetReadyThread->priority = calculateNewPriorityWith(targetReadyThread->recentCPU,
+                                                      targetReadyThread->niceValue);
+
+    eachThreadNode = list_next(eachThreadNode);
+  }
+}
+
+
+
+/** 시스템에 존재하는 모든 쓰레드(러닝쓰레드 & 레디쓰레드)의 LoadAvg, recentCPU 업데이트
+ * 1초(100 ticks)마다 불림 (timer_interrupt())
+*/
+void updateLoadAvg(void){
+
+  /** Load Avg 업데이트 : 레디 큐 길이 이용*/
+  int readyListLength = list_size(&ready_list);
+  struct thread * currentThread = thread_current();
+
+  //Running중인 현재 쓰레드도 포함
+  if(currentThread != idle_thread){
+    readyListLength++;
+  }
+
+  // load_avg = (59/60) * load_avg + (1/60) * ready_threads
+  int temp1 = multiplyFloatAndInt(loadAvg,59);
+  temp1 = sumOfFloatAndInt(temp1,readyListLength);
+  loadAvg = divideFloatByInt(temp1,60);
+}
+
+
+/** Recent CPU 업데이트 */
+void updateRecentCPU(void){
+
+  struct list_elem * eachReadyNode = list_begin(&all_list);
+  struct thread * targetReadyThread;
+
+  while(eachReadyNode!=list_end(&all_list)){
+
+    targetReadyThread = list_entry(eachReadyNode,struct thread, allelem);
+    
+    if(targetReadyThread != idle_thread){
+      // printf("updateRecentCPU : 계산 전 : 쓰레드 이름 : %s, recent CPU : %d, load Avg : %d\n",targetReadyThread->name,targetReadyThread->recentCPU,loadAvg);                                                
+      targetReadyThread->recentCPU = calculateNewRecentCPUWith(loadAvg,targetReadyThread->recentCPU,
+                                                        targetReadyThread->niceValue);
+      // printf("updateRecentCPU : 계산 후 : 쓰레드 이름 : %s, recent CPU : %d\n",targetReadyThread->name,targetReadyThread->recentCPU);                                                
+    }
+    
+    eachReadyNode = list_next(eachReadyNode);
+  }
+}
+
+
+/** recent_cpu = (2 * load_avg) / (2 * load_avg + 1 ) * recent_cpu + nice */
+int calculateNewRecentCPUWith(int loadAverage, int recentCPU, int nice){
+
+  int temp1 = multiplyFloatAndInt(loadAverage,2); // (2 * load_avg)
+  int temp2 = sumOfFloatAndInt(temp1,1); // (2 * load_avg + 1 )
+
+  temp1 = divideTwoFloats(temp1,temp2); // (2 * load_avg) / (2 * load_avg + 1 )
+
+  // (2 * load_avg) / (2 * load_avg + 1 ) * recent_cpu
+  temp1 = multiplyTwoFloats(temp1,recentCPU);
+
+  // (2 * load_avg) / (2 * load_avg + 1 ) * recent_cpu + nice
+  temp1 = sumOfFloatAndInt(temp1, nice);
+  
+  return temp1;
+}

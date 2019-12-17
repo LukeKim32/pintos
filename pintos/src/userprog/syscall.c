@@ -10,6 +10,11 @@
 #include "devices/input.h"
 #include "devices/shutdown.h"
 #include "process.h"
+#include "filesys/filesys.h"
+#include "filesys/file.h"
+#include "threads/malloc.h"
+#include "lib/user/syscall.h"
+#include "threads/synch.h"
 
 
 #define STDIN 0
@@ -19,13 +24,28 @@
 #define NEGATIVE 1
 #define NOT_A_NUMBER -2147483647
 #define MAXIMUM_STRING_LENGTH 256
+#define FILE_NAME_LENGTH_LIMIT 14
+#define FIRST_FILE_DESCRIPTOR 3
 
 static void syscall_handler(struct intr_frame *);
 
+struct lock fileSystemUseLock;
+
+/* An open file. */
+struct file 
+  {
+    struct inode *inode;        /* File's inode. */
+    off_t pos;                  /* Current position. */
+    bool deny_write;            /* Has file_deny_write() been called? */
+  };
+
+
 void syscall_init(void)
 {
+  lock_init(&fileSystemUseLock);
   intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
+
 
 static void
 syscall_handler(struct intr_frame *f UNUSED)
@@ -38,11 +58,12 @@ syscall_handler(struct intr_frame *f UNUSED)
   uint32_t outputStream;
   unsigned size;
   int targetIndex;
+  unsigned initialSize;
+  unsigned position;
   int inputs[4];
   int i;
-  // printf("시스템 콜 넘버 : %d\n",*(uint32_t *)(f->esp));
-  // hex_dump(f->esp, f->esp, 100, 1); 
-  checkValidUserVirtualAddress(f->esp+4); // 항상 처리 써주기
+
+  checkValidUserVirtualAddress(f->esp+4); 
   
   switch (*(uint32_t *)(f->esp)){
 
@@ -66,39 +87,76 @@ syscall_handler(struct intr_frame *f UNUSED)
       f->eax = wait(childPid);
       break;
 
+    case SYS_CREATE:                 
+      checkValidUserVirtualAddress(f->esp + 8);
+      fileName = (char *)*(uint32_t *)(f->esp + 4);
+      initialSize = (unsigned)*(uint32_t *)(f->esp + 8);
+      f->eax = create(fileName, initialSize);
+      break;
+
+    case SYS_REMOVE:              
+      fileName = (char *)*(uint32_t *)(f->esp + 4);
+      f->eax = remove(fileName);
+      break;
+
+    case SYS_OPEN:                  
+      fileName = (char *)*(uint32_t *)(f->esp + 4);
+      f->eax = open(fileName);
+      break;
+
+    case SYS_FILESIZE:
+      fileDescriptor = (int)*(uint32_t *)(f->esp + 4);
+      f->eax = filesize(fileDescriptor);
+      break;
+
+    case SYS_SEEK:
+      checkValidUserVirtualAddress(f->esp + 8);
+      fileDescriptor = (int)*(uint32_t *)(f->esp + 4);
+      position = (unsigned)*(uint32_t *)(f->esp + 8);
+      seek(fileDescriptor, position);
+      break;
+
+     case SYS_TELL:
+      checkValidUserVirtualAddress(f->esp + 4);
+      fileDescriptor = (int)*(uint32_t *)(f->esp + 4);
+      f->eax = tell(fileDescriptor);
+      break;
+
+    case SYS_CLOSE:
+      fileDescriptor = (int)*(uint32_t *)(f->esp + 4);
+      close(fileDescriptor);
+      break;
+
     case SYS_READ:
       //유저 스택 arguments에서 추출
-       checkValidUserVirtualAddress(f->esp+8);
-       checkValidUserVirtualAddress(f->esp+12); 
+      checkValidUserVirtualAddress(f->esp+8);
+      checkValidUserVirtualAddress(f->esp+12); 
 
-       fileDescriptor = (int)*(uint32_t *)(f->esp + 4);
-       inputStream = *(uint32_t *)(f->esp + 8);
-       size = (unsigned)*((uint32_t *)(f->esp + 12));
+      fileDescriptor = (int)*(uint32_t *)(f->esp + 4);
+      inputStream = *(uint32_t *)(f->esp + 8);
+      size = (unsigned)*((uint32_t *)(f->esp + 12));
 
       f->eax = read(fileDescriptor,(void *)inputStream,size);
       break;
 
     case SYS_WRITE:
       //유저 스택 arguments에서 추출
-       checkValidUserVirtualAddress(f->esp+8); 
-       checkValidUserVirtualAddress(f->esp+12); 
-           
-       fileDescriptor = (int)*(uint32_t *)(f->esp + 4);
-       outputStream = *(uint32_t *)(f->esp + 8);
-       size = (unsigned)*((uint32_t *)(f->esp + 12));
+      checkValidUserVirtualAddress(f->esp+8); 
+      checkValidUserVirtualAddress(f->esp+12); 
+
+      fileDescriptor = (int)*(uint32_t *)(f->esp + 4);
+      outputStream = *(uint32_t *)(f->esp + 8);
+      size = (unsigned)*((uint32_t *)(f->esp + 12));
 
       f->eax = write(fileDescriptor,(void *)outputStream,size);
       break;
 
     case FIBONACCI:
-      
       targetIndex = (int)*(uint32_t *)(f->esp + 4);     
       f->eax = fibonacci(targetIndex);
-
       break;
 
     case SUM_OF_FOUR_INT:
-      
       for(i=0;i<4;i++){
         inputs[i] = (int)*(uint32_t *)(f->esp + 4*(i+1));
       }
@@ -138,7 +196,6 @@ void exit (int status){
 	notifyTerminationToParent(thread_current(),status);
 
   thread_exit(); //여기서 이 쓰레드가 할당 해제될 것이다 (schedule())
-
 }
 
 /** @parameter
@@ -148,31 +205,28 @@ void exit (int status){
 */
 void notifyTerminationToParent(struct thread *childThread, int exitStatus){
 
-   struct thread * parentThread = list_entry(childThread->parent,struct thread,self);
+   struct thread * parentThread = childThread->parent;
    tid_t childTid = childThread->tid;
 
-   struct list_elem * eachChild = list_begin(&parentThread->childStatusList);
+   struct list_elem * eachChildStatusLink = list_begin(&parentThread->childStatusList);
    int childProcessListLength = list_size(&parentThread->childStatusList);
    struct childStatus * eachChildStatusNode;
 
-   int eachChildIndex;
+   int i;
   
-   for(eachChildIndex=0;eachChildIndex < childProcessListLength;eachChildIndex++){
+   for(i=0;i < childProcessListLength;i++){
     
-    eachChildStatusNode = list_entry(eachChild,struct childStatus, self);
-    // printf("for loop tid : %d, child_tid : %d\n",eachThread->tid,child_tid);
-    // printf("Loop 쓰레드 이름 : %s\n",eachThread->name);
+    eachChildStatusNode = list_entry(eachChildStatusLink,struct childStatus, self);
+
     if(eachChildStatusNode->childTid == childTid){
        eachChildStatusNode->exitStatus = exitStatus;
-
-       //printf("\n%d 쓰레드 종료 - 상태 %d 저장\n",childTid,exitStatus);
+       break;
     }
 
-    eachChild = list_next(eachChild);
+    eachChildStatusLink = list_next(eachChildStatusLink);
    }
 
 }
-
 
 void halt(void){
   shutdown_power_off();
@@ -189,58 +243,297 @@ pid_t wait(pid_t childPid){
 }
 
 
+bool create (const char *file, unsigned initial_size) {
+  if(file == NULL){
+    exit(NOT_PROPER_ACCESS);
+  }
+
+  bool createSuccess = false;
+
+  lock_acquire(&fileSystemUseLock);
+  createSuccess = filesys_create(file, initial_size);
+  lock_release(&fileSystemUseLock);
+
+  return createSuccess;
+}
+
+
+bool remove (const char *file) {
+  if(file == NULL){
+    exit(NOT_PROPER_ACCESS);
+  }
+
+  bool removeSuccess = false;
+
+  lock_acquire(&fileSystemUseLock);
+  removeSuccess = filesys_remove(file);
+  lock_release(&fileSystemUseLock);
+
+  return removeSuccess;
+}
+
+
+void close (int fd) {
+
+  lock_acquire(&fileSystemUseLock);
+
+  struct fileDescriptor * targetFileDescriptor = getFileDescriptorFrom(fd);
+
+  if(targetFileDescriptor == NULL){
+    lock_release(&fileSystemUseLock);
+    exit(NOT_PROPER_ACCESS);
+  }
+
+  struct file * targetFile = targetFileDescriptor->file;
+
+  if(targetFile == NULL){
+    lock_release(&fileSystemUseLock);
+    exit(NOT_PROPER_ACCESS);
+  }
+
+  // 현재 쓰레드의 File Descriptor List에서 제거 및 해제
+  list_remove(&(targetFileDescriptor->self));
+  free(targetFileDescriptor);
+
+  file_close(targetFile);
+
+  lock_release(&fileSystemUseLock);
+
+}
+
+
+int filesize (int fd) {
+  // fd를 통해 fileName을 알아야함
+  struct file * targetFile = getFilePointerFrom(fd);
+
+  if(targetFile == NULL){
+    exit(NOT_PROPER_ACCESS);
+  }
+
+  return file_length(targetFile);
+}
+
+void seek (int fd, unsigned position) {
+
+  struct file * targetFile = getFilePointerFrom(fd);
+
+  if(targetFile == NULL){
+    exit(NOT_PROPER_ACCESS);
+  }
+
+  file_seek(targetFile, position);
+}
+
+
+/** @FileDescriptor Number 값을 이용해 
+ * 현재 쓰레드의 Open 되어 있는 File 포인터를 찾아 반환한다
+*/
+struct file * getFilePointerFrom(int fileDescriptorNumber){
+  struct fileDescriptor * targetFileDescriptor = getFileDescriptorFrom(fileDescriptorNumber);
+  
+  struct file * targetFile = NULL;
+  if(targetFileDescriptor != NULL){
+    targetFile = targetFileDescriptor->file;
+  }
+
+  return targetFile;
+}
+
+/** @FileDescriptor Number 값을 이용해 
+ * 현재 쓰레드의 Open 되어 있는 File에 대한 정보가 담겨있는
+ * FileDescriptor 구조체를 찾아 반환한다
+*/
+struct fileDescriptor * getFileDescriptorFrom(int fileDescriptorNumber){
+  struct thread * currentThread = thread_current();//list_entry(thread_current()->parent,struct thread,self);
+  struct list * fileDescriptorList = &(currentThread->fileDescriptorList);
+
+  struct list_elem * eachFileDescriptorLink = list_begin(fileDescriptorList);
+  int fileDescriptorListLength = list_size(fileDescriptorList);
+   
+  int i;
+  struct fileDescriptor * eachFileDescriptorNode = NULL;
+  
+   for(i=0;i < fileDescriptorListLength;i++){
+    
+    eachFileDescriptorNode = list_entry(eachFileDescriptorLink,struct fileDescriptor, self);
+
+    if(eachFileDescriptorNode->number == fileDescriptorNumber){
+      return eachFileDescriptorNode;
+    }
+
+    eachFileDescriptorLink = list_next(eachFileDescriptorLink);
+   }
+
+  return eachFileDescriptorNode;
+
+}
+
+
+
+int open (const char *file){
+  
+  if(file == NULL){
+    exit(NOT_PROPER_ACCESS);
+  }
+
+  // File Name 길이가 14 초과
+  if(strlen(file)>FILE_NAME_LENGTH_LIMIT){ 
+    exit(NOT_PROPER_ACCESS);
+  }
+
+  checkValidUserVirtualAddress(file);
+
+  lock_acquire(&fileSystemUseLock); // 아래서부터 Critical section - shared memory : fileSystem & 현재쓰레드의 fileDescriptorList
+
+  struct file * targetFile = filesys_open(file);
+  
+  if(targetFile == NULL){
+    lock_release(&fileSystemUseLock);
+    return -1;
+  }
+
+  if (strcmp(thread_name(), file) == 0) {
+    file_deny_write(targetFile);
+  } 
+
+  // fileDescriptor 값은 각 open할 file에 대해 순차적으로 할당되어야 하므로 CS 내부. (중간에 context switch 방지)
+  int newFileDescriptorNumber = allocateNewFileDescriptor(targetFile);
+
+  lock_release(&fileSystemUseLock);
+
+  return newFileDescriptorNumber;
+}
+
+
+/** 현재 쓰레드의 open된 File들의 리스트에 대한 정보 = FileDescriptorList
+ * 에서 가장 마지막 File Descriptor 값 + 1 을
+ * 새 File Descriptor로 할당하며 리스트에 추가한다.
+*/
+int allocateNewFileDescriptor(struct file * file){
+  
+  struct thread * currentThread = thread_current();
+  struct list * fileDescriptorList = &currentThread->fileDescriptorList;
+
+  int newFileDescriptorNumber;
+
+  if(list_empty(fileDescriptorList)){
+    newFileDescriptorNumber = FIRST_FILE_DESCRIPTOR;
+
+  }else { // list not empty, 마지막 fd 다음 값 확인
+
+    struct list_elem * lastFileDescriptorNode = list_rbegin(&currentThread->fileDescriptorList);
+    struct fileDescriptor * lastFileDescriptor = list_entry(lastFileDescriptorNode,struct fileDescriptor,self);
+
+    // 새로운 FD 값 = 마지막 file Descriptor 값 + 1 로 할당
+    newFileDescriptorNumber = lastFileDescriptor->number + 1;
+  }
+
+  struct fileDescriptor * newFileDescriptor = (struct fileDescriptor *)malloc(sizeof(struct fileDescriptor));
+  newFileDescriptor->number = newFileDescriptorNumber;
+  newFileDescriptor->file = file;
+
+  list_push_back(&currentThread->fileDescriptorList,&(newFileDescriptor->self));
+
+  return newFileDescriptorNumber;
+}
+
+
 /** InputStream : uint32_t
  * input_getc()로 부터 STDIN 입력 => inputStream(=input Buffer)에 저장
  */
 int read (int fileDescriptor, void *inputStream, unsigned size){
-
+  // printf("Read 들어옴!\n");
  unsigned eachByte;
+ int finalBytesRead=0;
+ struct file * targetFile;
+
+ checkValidUserVirtualAddress(inputStream);
+ 
+ if(fileDescriptor < 0 || inputStream == NULL){
+    return NOT_PROPER_ACCESS;
+  }
+
+  lock_acquire(&fileSystemUseLock);
+
   switch(fileDescriptor){
     case STDIN:
-      // Loop 돌면서 input에 엔터가 들어왔을 때 탈출을 해야하는건지..?
-
       eachByte=0;
       for(; eachByte<size ; eachByte++){
         ((uint8_t *)inputStream)[eachByte]=input_getc();
       }
+      
+      finalBytesRead = (int)eachByte;
+      break;
 
-      return (int)eachByte;
+    case STDOUT :
+      finalBytesRead = NOT_PROPER_ACCESS;
+      break;
 
     default :
-      return NOT_PROPER_ACCESS;
+      targetFile = getFilePointerFrom(fileDescriptor);
+      if(targetFile==NULL){
+        exit(NOT_PROPER_ACCESS);
+      }
+
+      finalBytesRead = file_read(targetFile,inputStream,size);
+      break;
   }
+
+  lock_release(&fileSystemUseLock);
+  return finalBytesRead;
 }
+
 
 /** OutputStream : uint32_t
  * outputStream(=output Buffer)에서 값을 읽어와 fileDescriptor에 출력
  */
 int write (int fileDescriptor, const void *outputStream, unsigned size){
-  // unsigned eachByte;
-  // uint8_t singleOutputByte;
+
+  struct file * targetFile;
+  int finalBytesWritten = 0;
+
+  checkValidUserVirtualAddress(outputStream);
+
+  if(fileDescriptor < 0 || outputStream == NULL){
+    return NOT_PROPER_ACCESS;
+  }
+
+  lock_acquire(&fileSystemUseLock);
 
   switch(fileDescriptor){
     case STDOUT:
-      //스택에 쌓아놓은 argument ex. echo 'x'
-
-      //===========input_putc error!!====
-      // eachByte=0;
-      //  enum intr_level interruptLevel = intr_disable();
-      // for(; eachByte<size ; eachByte++){
-      //   singleOutputByte = ((uint8_t*)outputStream)[eachByte];
-      //   input_putc(singleOutputByte);
-      //   printf("출력 : %c\n",singleOutputByte);
-      // }
-      // intr_set_level(interruptLevel);
-      // return (int)eachByte;
-
       putbuf(outputStream, size);
-      return (int)size;
+      finalBytesWritten = (int)size;
+      break;
+
+    case STDIN :
+      finalBytesWritten = NOT_PROPER_ACCESS;
+      break;
 
     default :
-      return NOT_PROPER_ACCESS;
+      targetFile = getFilePointerFrom(fileDescriptor);
+      if(targetFile==NULL){
+        exit(NOT_PROPER_ACCESS);
+      }
 
+      finalBytesWritten= file_write(targetFile,outputStream,size);
+      break;
   }
+
+  lock_release(&fileSystemUseLock);
+  return finalBytesWritten;
 }
+
+unsigned tell (int fd) {
+  struct file * targetFile = getFilePointerFrom(fd);
+
+  if(targetFile == NULL){
+    exit(NOT_PROPER_ACCESS);
+  }
+
+  return file_tell(targetFile);
+}
+
 
 /** User-defined System call
  * Fibonacci dp
@@ -265,6 +558,7 @@ int fibonacci(int n){
 
   return fibonacciSequence[n];
 }
+
 
 /** User-defined system call2
 */
